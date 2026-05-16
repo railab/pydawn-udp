@@ -22,6 +22,15 @@ from dawnpy.simple_protocol import SimpleProtocolBase
 class DawnUdpProtocol(SimpleProtocolBase):  # pragma: no cover
     """Client for communicating with Dawn devices via UDP."""
 
+    INITIAL_RETRIES = 1
+    SAFE_RETRY_COMMANDS = {
+        SimpleProtocolBase.CMD_PING,
+        SimpleProtocolBase.CMD_LIST_IOS,
+        SimpleProtocolBase.CMD_GET_INFO,
+        SimpleProtocolBase.CMD_GET_IO,
+        SimpleProtocolBase.CMD_GET_IO_SEEK,
+    }
+
     def __init__(
         self,
         host: str,
@@ -116,21 +125,46 @@ class DawnUdpProtocol(SimpleProtocolBase):  # pragma: no cover
             ),
         )
 
+    def _exchange(
+        self,
+        cmd: int,
+        payload: bytes = b"",
+        *,
+        retries: int = 0,
+    ) -> tuple[int, bytes] | None:
+        """Send one UDP request and optionally retry on missing reply."""
+        for attempt in range(retries + 1):
+            if not self.send_frame(cmd, payload):
+                return None
+
+            frame_data = self.receive_frame()
+            if frame_data is not None:
+                return frame_data
+
+            if attempt < retries:
+                self._log(
+                    f"Retrying UDP request CMD=0x{cmd:02X} after no response"
+                )
+
+        return None
+
     def ping(self) -> bool:
         """Send a ping and wait for a pong response."""
-        return self._ping_with_messages(
-            start_message="\nPinging device via UDP...",
-            success_message="Device responded with PONG via UDP!",
-            failure_message="No PONG response from device",
-        )
+        self._log("\nPinging device via UDP...")
+        response = self._exchange(self.CMD_PING, retries=self.INITIAL_RETRIES)
+        if response and response[0] == self.CMD_PONG:
+            self._log("Device responded with PONG via UDP!")
+            return True
+
+        self._err("No PONG response from device")
+        return False
 
     def get_io_list(self) -> list[int]:
         """Fetch and cache the list of available IO object IDs."""
         self._log("\nGetting available IO objects via UDP...")
-        if not self.send_frame(self.CMD_LIST_IOS):
-            return []
-
-        frame_data = self.receive_frame()
+        frame_data = self._exchange(
+            self.CMD_LIST_IOS, retries=self.INITIAL_RETRIES
+        )
         if not frame_data:
             return []
 
@@ -143,10 +177,9 @@ class DawnUdpProtocol(SimpleProtocolBase):  # pragma: no cover
     def get_io_info(self, objid: int) -> dict[str, Any] | None:
         """Fetch metadata for one IO object."""
         payload = struct.pack("<I", objid)
-        if not self.send_frame(self.CMD_GET_INFO, payload):
-            return None
-
-        frame_data = self.receive_frame()
+        frame_data = self._exchange(
+            self.CMD_GET_INFO, payload, retries=self.INITIAL_RETRIES
+        )
         if not frame_data:
             return None
 
@@ -158,7 +191,11 @@ class DawnUdpProtocol(SimpleProtocolBase):  # pragma: no cover
 
     def read_io(self, objid: int) -> bytes | None:
         """Read raw payload bytes for an IO object."""
-        frame = self._exchange_objid(self.CMD_GET_IO, objid)
+        frame = self._exchange(
+            self.CMD_GET_IO,
+            struct.pack("<I", objid),
+            retries=self.INITIAL_RETRIES,
+        )
         cmd, data = frame or (None, None)
         if cmd != self.CMD_GET_IO:
             return None
@@ -192,9 +229,11 @@ class DawnUdpProtocol(SimpleProtocolBase):  # pragma: no cover
     ) -> tuple[int, bytes] | None:
         """Read one chunk from a seekable IO, returning total size and data."""
         payload = struct.pack("<II", objid, offset)
-        if not self.send_frame(self.CMD_GET_IO_SEEK, payload):
-            return None
-        frame_data = self.receive_frame()
+        frame_data = self._exchange(
+            self.CMD_GET_IO_SEEK,
+            payload,
+            retries=self.INITIAL_RETRIES,
+        )
         if (
             not frame_data
             or frame_data[0] != self.CMD_GET_IO_SEEK
